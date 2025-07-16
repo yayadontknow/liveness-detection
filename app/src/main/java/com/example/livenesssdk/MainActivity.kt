@@ -52,7 +52,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { handleLivenessResult(isLive) }
         }
         colorFlasher = ColorFlasher(rootLayout)
-
+        setFullBrightness()
         if (allPermissionsGranted()) {
             startCamera()
         } else {
@@ -149,5 +149,11 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacksAndMessages(null)
         cameraExecutor.shutdown()
         cameraProvider?.unbindAll()
+    }
+
+    private fun setFullBrightness() {
+        val layoutParams = window.attributes
+        layoutParams.screenBrightness = 1f
+        window.attributes = layoutParams
     }
 }
