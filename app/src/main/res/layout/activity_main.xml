@@ -38,5 +38,18 @@
         tools:text="Yes"
         tools:textColor="@android:color/holo_green_dark"
         tools:visibility="visible" />
-
+    <ImageView
+        android:id="@+id/debug_iris_view"
+        android:layout_width="100dp"
+        android:layout_height="100dp"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="16dp"
+        android:background="#333333"
+        android:elevation="8dp"
+        android:scaleType="fitCenter"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:src="@tools:sample/avatars"
+        tools:visibility="visible" />
 </androidx.constraintlayout.widget.ConstraintLayout>

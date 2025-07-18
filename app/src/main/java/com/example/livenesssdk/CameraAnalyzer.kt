@@ -1,3 +1,4 @@
+// file path: E:\Competitions\LivenessSDK\app\src\main\java\com\example\livenesssdk\CameraAnalyzer.kt
 package com.example.livenesssdk
 
 import android.content.Context
@@ -7,40 +8,46 @@ import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.Face
+// Import the correct builder class
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import java.io.ByteArrayOutputStream
 
 class CameraAnalyzer(
     private val context: Context,
-    private val onFaceDetected: (Bitmap, Face) -> Unit
+    // The callback now receives a MediaPipe FaceLandmarkerResult
+    private val onFaceDetected: (Bitmap, FaceLandmarkerResult) -> Unit
 ) : ImageAnalysis.Analyzer {
+
+    // Get the MediaPipe detector instance
+    private val faceLandmarker = MediaPipeFaceMeshHelper.getDetector(context)
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
+        val bitmap = imageProxy.toBitmap() // Convert the frame to a Bitmap
+        if (bitmap == null) {
             imageProxy.close()
             return
         }
 
-        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        try {
+            // THE CORRECT WAY: Use BitmapImageBuilder to create an MPImage
+            val mpImage = BitmapImageBuilder(bitmap).build()
 
-        FaceDetectorHelper.detector.process(inputImage)
-            .addOnSuccessListener { faces ->
-                if (faces.isNotEmpty()) {
-                    val bitmap = imageProxy.toBitmap()
-                    if (bitmap != null) {
-                        onFaceDetected(bitmap, faces[0])
-                    }
-                }
+            val result = faceLandmarker.detect(mpImage)
+
+            // Check if any faces were detected
+            if (result != null && result.faceLandmarks().isNotEmpty()) {
+                // Pass the bitmap and the result to the callback
+                onFaceDetected(bitmap, result)
             }
-            .addOnCompleteListener {
-                imageProxy.close()
-            }
-            .addOnFailureListener { e ->
-                Log.e("CameraAnalyzer", "Face detection failed", e)
-            }
+        } catch (e: Exception) {
+            Log.e("CameraAnalyzer", "MediaPipe face landmark detection failed", e)
+        } finally {
+            // IMPORTANT: Close the ImageProxy to allow the next frame to be processed
+            imageProxy.close()
+        }
     }
 }
 
