@@ -4,10 +4,13 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.ProgressBar
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.core.Camera
@@ -28,11 +31,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progressBar: ProgressBar
 
     private var camera: Camera? = null
+    private var imageAnalyzer: ImageAnalysis? = null
     private lateinit var cameraExecutor: ExecutorService
 
+    // --- State Management ---
     @Volatile
-    private var isProcessing = false
+    private var isProcessingFrame = false
     private var currentFrameBitmap: Bitmap? = null
+    private var lastDetectedIdBox: RectF? = null
+    private val circleStates = MutableList(6) { CircleState.INCOMPLETE }
+    private val isCheckingHologram = BooleanArray(6) { false }
+    private var lastIdCardCrop: Bitmap? = null // *** KEY CHANGE: Store the ID card crop ***
+    // --- End State Management ---
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
@@ -48,76 +58,225 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.preview_view)
         overlayView = findViewById(R.id.overlay_view)
         progressBar = findViewById(R.id.progress_bar)
-
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        if (allPermissionsGranted()) { // <-- This function needs to exist
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE
-            )
-        }
+        if (allPermissionsGranted()) { startCamera() }
+        else { ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE) }
     }
 
-    // --- Start of Fix ---
-    // Add this function back into the class
-    private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(
-        this, Manifest.permission.CAMERA
-    ) == PackageManager.PERMISSION_GRANTED
-    // --- End of Fix ---
+    private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-
-            val imageAnalyzer = ImageAnalysis.Builder()
+            imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, setupAnalyzer())
-                }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                .build().also { it.setAnalyzer(cameraExecutor, setupAnalyzer()) }
 
             try {
                 cameraProvider.unbindAll()
-                camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+                camera = cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
                 camera?.cameraControl?.enableTorch(true)
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
-            }
+            } catch (exc: Exception) { Log.e(TAG, "Use case binding failed", exc) }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun setupAnalyzer(): ImageAnalysis.Analyzer {
         return ImageAnalysis.Analyzer { imageProxy ->
-            if (isProcessing) {
+            if (isProcessingFrame) {
                 imageProxy.close()
                 return@Analyzer
             }
-            isProcessing = true
+            isProcessingFrame = true
 
             currentFrameBitmap = getRotatedBitmap(imageProxy)
-            val croppedBitmapForServer = cropBitmapByGuideBox(currentFrameBitmap)
-
+            val idCardCrop = cropBitmapByGuideBox(currentFrameBitmap)
+            lastIdCardCrop = idCardCrop // *** KEY CHANGE: Store the crop ***
             imageProxy.close()
 
-            if (croppedBitmapForServer != null) {
-                runOnUiThread { setUiInProgress(true) }
-                processAndSendImage(croppedBitmapForServer)
+            if (idCardCrop != null) {
+                processAndSendIdCard(idCardCrop)
             } else {
-                Log.e(TAG, "Failed to crop image for server.")
-                isProcessing = false
+                isProcessingFrame = false
             }
         }
+    }
+
+    private fun processAndSendIdCard(idCardCrop: Bitmap) {
+        val finalBitmap = Bitmap.createScaledBitmap(idCardCrop, 640, 640, true)
+        val outputStream = ByteArrayOutputStream()
+        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+
+        NetworkClient.detectIdCard(imageBytes = outputStream.toByteArray()) { response, _ ->
+            handleIdCardResponse(response)
+        }
+    }
+
+    private fun handleIdCardResponse(jsonResponse: String?) {
+        val bitmapToAnalyze = currentFrameBitmap
+        if (jsonResponse == null || bitmapToAnalyze == null) {
+            runOnUiThread { overlayView.clearResults() }
+            isProcessingFrame = false
+            return
+        }
+
+        try {
+            val detections = JSONObject(jsonResponse).getJSONArray("detections")
+            if (detections.length() == 0) {
+                runOnUiThread { overlayView.clearResults() }
+                isProcessingFrame = false
+                return
+            }
+
+            val firstDetection = detections.getJSONObject(0)
+            val bboxArray = firstDetection.getJSONArray("bbox")
+            val guideBox = overlayView.getGuideBox()
+            lastDetectedIdBox = RectF(
+                guideBox.left + (bboxArray.getDouble(0).toFloat() / 640f) * guideBox.width(),
+                guideBox.top + (bboxArray.getDouble(1).toFloat() / 640f) * guideBox.height(),
+                guideBox.left + (bboxArray.getDouble(2).toFloat() / 640f) * guideBox.width(),
+                guideBox.top + (bboxArray.getDouble(3).toFloat() / 640f) * guideBox.height()
+            )
+
+            triggerHologramChecks(bitmapToAnalyze, lastDetectedIdBox!!)
+
+        } catch (e: JSONException) {
+            Log.e(TAG, "Failed to parse ID card JSON", e)
+            isProcessingFrame = false
+        }
+    }
+
+    private fun triggerHologramChecks(bitmap: Bitmap, boxOnScreen: RectF) {
+        if (boxOnScreen.height() <= 0) {
+            isProcessingFrame = false
+            return
+        }
+
+        val dynamicRadius = (boxOnScreen.height() / 3f) / 2f
+        val insetMargin = dynamicRadius
+
+        val pointsOnScreen = listOf(
+            PointF(boxOnScreen.left + insetMargin, boxOnScreen.top + insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.top + insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.top + insetMargin),
+            PointF(boxOnScreen.left + insetMargin, boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.bottom - insetMargin)
+        )
+
+        var checksTriggered = false
+        pointsOnScreen.forEachIndexed { index, point ->
+            if (circleStates[index] == CircleState.SUCCESS || isCheckingHologram[index]) return@forEachIndexed
+
+            val regionOnScreen = RectF(point.x - dynamicRadius, point.y - dynamicRadius, point.x + dynamicRadius, point.y + dynamicRadius)
+            val regionOnBitmap = mapPreviewBoxToBitmapBox(regionOnScreen, bitmap.width, bitmap.height)
+
+            if (hasReflection(bitmap, regionOnBitmap)) {
+                checksTriggered = true
+                isCheckingHologram[index] = true
+                performHologramCheck(index) // No longer need to pass bitmap/region
+            }
+        }
+
+        if (!checksTriggered) {
+            isProcessingFrame = false
+        }
+
+        updateOverlay()
+    }
+
+    // *** KEY CHANGE: This function now uses the stored ID card crop ***
+    private fun performHologramCheck(index: Int) {
+        val idCardImage = lastIdCardCrop
+        if (idCardImage == null) {
+            Log.e(TAG, "Cannot perform hologram check, ID card image is null")
+            isCheckingHologram[index] = false
+            isProcessingFrame = false
+            return
+        }
+
+        // We send the entire ID card image, not a new crop
+        val finalBitmap = Bitmap.createScaledBitmap(idCardImage, 640, 640, true)
+        val outputStream = ByteArrayOutputStream()
+        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+
+        NetworkClient.detectHologram(outputStream.toByteArray()) { response, _ ->
+            val numDetections = try {
+                if (response == null) 0 else JSONObject(response).getJSONArray("detections").length()
+            } catch (e: JSONException) { 0 }
+
+            val isCorner = index in listOf(0, 2, 3, 5)
+            val checkPassed = if (isCorner) numDetections == 0 else numDetections == 1
+
+            if (checkPassed) {
+                circleStates[index] = CircleState.SUCCESS
+                checkForCompletion()
+            } else {
+                circleStates[index] = CircleState.FAILURE
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if(circleStates[index] == CircleState.FAILURE) {
+                        circleStates[index] = CircleState.INCOMPLETE
+                        updateOverlay()
+                    }
+                }, 1000)
+            }
+
+            isCheckingHologram[index] = false
+            if (isCheckingHologram.none { it }) {
+                isProcessingFrame = false
+            }
+            updateOverlay()
+        }
+    }
+
+    private fun checkForCompletion() {
+        if (circleStates.all { it == CircleState.SUCCESS }) {
+            runOnUiThread {
+                stopAnalysis()
+                AlertDialog.Builder(this)
+                    .setTitle("Verification Complete")
+                    .setMessage("All checks passed successfully.")
+                    .setPositiveButton("OK") { dialog, _ -> dialog.dismiss(); finish() }
+                    .setCancelable(false)
+                    .show()
+            }
+        }
+    }
+
+    private fun stopAnalysis() {
+        imageAnalyzer?.clearAnalyzer()
+        camera?.cameraControl?.enableTorch(false)
+        isProcessingFrame = true
+    }
+
+    private fun updateOverlay() {
+        lastDetectedIdBox?.let { box ->
+            val result = OverlayView.DetectionResult(box, "ID Found", circleStates.toList())
+            runOnUiThread { overlayView.setResults(result) }
+        }
+    }
+
+    private fun hasReflection(bitmap: Bitmap, region: Rect): Boolean {
+        if (region.width() <= 0 || region.height() <= 0) return false
+        region.intersect(0, 0, bitmap.width, bitmap.height)
+        val totalPixels = region.width() * region.height()
+        if (totalPixels == 0) return false
+        var brightPixelCount = 0
+        val pixels = IntArray(totalPixels)
+        try {
+            bitmap.getPixels(pixels, 0, region.width(), region.left, region.top, region.width(), region.height())
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting pixels from region $region", e)
+            return false
+        }
+        for (color in pixels) {
+            val brightness = (Color.red(color) + Color.green(color) + Color.blue(color)) / 3
+            if (brightness > BRIGHTNESS_THRESHOLD) {
+                brightPixelCount++
+            }
+        }
+        val percentage = brightPixelCount.toFloat() / totalPixels.toFloat()
+        return percentage > BRIGHT_PIXEL_PERCENTAGE_THRESHOLD
     }
 
     private fun getRotatedBitmap(image: ImageProxy): Bitmap? {
@@ -131,137 +290,12 @@ class MainActivity : AppCompatActivity() {
         if (sourceBitmap == null) return null
         val guideBox = overlayView.getGuideBox()
         val cropRect = mapPreviewBoxToBitmapBox(guideBox, sourceBitmap.width, sourceBitmap.height)
-
         return try {
-            Bitmap.createBitmap(
-                sourceBitmap,
-                cropRect.left,
-                cropRect.top,
-                cropRect.width(),
-                cropRect.height()
-            )
+            Bitmap.createBitmap(sourceBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to crop bitmap with rect: $cropRect and bitmap size: ${sourceBitmap.width}x${sourceBitmap.height}", e)
+            Log.e(TAG, "Failed to crop bitmap", e)
             null
         }
-    }
-
-    private fun processAndSendImage(croppedBitmap: Bitmap) {
-        val finalBitmap = Bitmap.createScaledBitmap(croppedBitmap, 640, 640, true)
-        val outputStream = ByteArrayOutputStream()
-        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
-        val imageBytes = outputStream.toByteArray()
-
-        NetworkClient.detectIdCard(imageBytes) { response, error ->
-            runOnUiThread {
-                setUiInProgress(false)
-                if (response != null) {
-                    handleNetworkResponse(response)
-                } else {
-                    overlayView.clearResults()
-                }
-                isProcessing = false
-            }
-        }
-    }
-
-    private fun handleNetworkResponse(jsonResponse: String) {
-        val bitmapToAnalyze = currentFrameBitmap
-        if (bitmapToAnalyze == null) {
-            overlayView.clearResults()
-            return
-        }
-
-        try {
-            val detections = JSONObject(jsonResponse).getJSONArray("detections")
-            if (detections.length() == 0) {
-                overlayView.clearResults()
-                return
-            }
-
-            val firstDetection = detections.getJSONObject(0)
-            val confidence = firstDetection.getDouble("confidence")
-            val bboxArray = firstDetection.getJSONArray("bbox")
-            val x1 = bboxArray.getDouble(0).toFloat()
-            val y1 = bboxArray.getDouble(1).toFloat()
-            val x2 = bboxArray.getDouble(2).toFloat()
-            val y2 = bboxArray.getDouble(3).toFloat()
-
-            val guideBox = overlayView.getGuideBox()
-            val resultBoxOnScreen = RectF(
-                guideBox.left + (x1 / 640f) * guideBox.width(),
-                guideBox.top + (y1 / 640f) * guideBox.height(),
-                guideBox.left + (x2 / 640f) * guideBox.width(),
-                guideBox.top + (y2 / 640f) * guideBox.height()
-            )
-
-            val circleStates = checkReflections(bitmapToAnalyze, resultBoxOnScreen)
-
-            val label = "ID Confidence: ${String.format("%.2f", confidence)}"
-            val result = OverlayView.DetectionResult(resultBoxOnScreen, label, circleStates)
-            overlayView.setResults(result)
-
-        } catch (e: JSONException) {
-            Log.e(TAG, "Failed to parse JSON response", e)
-            overlayView.clearResults()
-        }
-    }
-
-    private fun checkReflections(bitmap: Bitmap, boxOnScreen: RectF): List<Boolean> {
-        if (boxOnScreen.height() <= 0) return List(6) { false }
-
-        val dynamicRadius = (boxOnScreen.height() / 3f) / 2f
-        val insetMargin = dynamicRadius
-
-        val pointsOnScreen = listOf(
-            PointF(boxOnScreen.left + insetMargin, boxOnScreen.top + insetMargin),
-            PointF(boxOnScreen.centerX(), boxOnScreen.top + insetMargin),
-            PointF(boxOnScreen.right - insetMargin, boxOnScreen.top + insetMargin),
-            PointF(boxOnScreen.left + insetMargin, boxOnScreen.bottom - insetMargin),
-            PointF(boxOnScreen.centerX(), boxOnScreen.bottom - insetMargin),
-            PointF(boxOnScreen.right - insetMargin, boxOnScreen.bottom - insetMargin)
-        )
-
-        return pointsOnScreen.map { pointOnScreen ->
-            val regionOnBitmap = RectF(
-                pointOnScreen.x - dynamicRadius,
-                pointOnScreen.y - dynamicRadius,
-                pointOnScreen.x + dynamicRadius,
-                pointOnScreen.y + dynamicRadius
-            )
-            val mappedRegion = mapPreviewBoxToBitmapBox(regionOnBitmap, bitmap.width, bitmap.height)
-            hasReflection(bitmap, mappedRegion)
-        }
-    }
-
-    private fun hasReflection(bitmap: Bitmap, region: Rect): Boolean {
-        if (region.width() <= 0 || region.height() <= 0) return false
-        region.intersect(0, 0, bitmap.width, bitmap.height)
-
-        val totalPixels = region.width() * region.height()
-        if (totalPixels == 0) return false
-
-        var brightPixelCount = 0
-        val pixels = IntArray(totalPixels)
-        try {
-            bitmap.getPixels(pixels, 0, region.width(), region.left, region.top, region.width(), region.height())
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting pixels from region $region", e)
-            return false
-        }
-
-        for (color in pixels) {
-            val r = Color.red(color)
-            val g = Color.green(color)
-            val b = Color.blue(color)
-            val brightness = (r + g + b) / 3
-            if (brightness > BRIGHTNESS_THRESHOLD) {
-                brightPixelCount++
-            }
-        }
-
-        val percentage = brightPixelCount.toFloat() / totalPixels.toFloat()
-        return percentage > BRIGHT_PIXEL_PERCENTAGE_THRESHOLD
     }
 
     private fun mapPreviewBoxToBitmapBox(previewBox: RectF, bitmapWidth: Int, bitmapHeight: Int): Rect {
@@ -292,9 +326,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun ImageProxy.toBitmap(): Bitmap? {
         val image = this.image ?: return null
-        if (image.format != ImageFormat.YUV_420_888) {
-            return null
-        }
+        if (image.format != ImageFormat.YUV_420_888) { return null }
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer
         val vBuffer = image.planes[2].buffer
@@ -312,14 +344,13 @@ class MainActivity : AppCompatActivity() {
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
-    private fun setUiInProgress(inProgress: Boolean) {
-        progressBar.visibility = if (inProgress) View.VISIBLE else View.GONE
-    }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == CAMERA_PERMISSION_CODE) {
-            if (allPermissionsGranted()) { startCamera() } else { finish() }
+            if (allPermissionsGranted()) { startCamera() } else {
+                Toast.makeText(this, "Camera permissions are required.", Toast.LENGTH_LONG).show()
+                finish()
+            }
         }
     }
 

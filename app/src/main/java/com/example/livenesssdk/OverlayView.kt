@@ -1,10 +1,17 @@
 package com.example.livenesssdk
 
 import android.content.Context
-import android.graphics.* // This will now correctly import PointF
+import android.graphics.*
 import android.util.AttributeSet
 import android.view.View
 import kotlin.math.min
+
+// Enum to represent the three possible states of a validation circle
+enum class CircleState {
+    INCOMPLETE, // Not yet validated (Green)
+    SUCCESS,    // Validation passed (Red)
+    FAILURE     // Validation failed (Yellow, temporary)
+}
 
 class OverlayView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -44,10 +51,18 @@ class OverlayView @JvmOverloads constructor(
         isAntiAlias = true
     }
 
+    // New Paint for the failure state
+    private val yellowCirclePaint = Paint().apply {
+        color = Color.YELLOW
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+        isAntiAlias = true
+    }
+
     data class DetectionResult(
         val box: RectF,
         val label: String,
-        val circleStates: List<Boolean>
+        val circleStates: List<CircleState>
     )
 
     private var result: DetectionResult? = null
@@ -65,7 +80,7 @@ class OverlayView @JvmOverloads constructor(
         }
     }
 
-    private fun drawValidationCircles(canvas: Canvas, box: RectF, states: List<Boolean>) {
+    private fun drawValidationCircles(canvas: Canvas, box: RectF, states: List<CircleState>) {
         if (box.height() <= 0 || states.size < 6) return
 
         val dynamicRadius = (box.height() / 3f) / 2f
@@ -81,7 +96,12 @@ class OverlayView @JvmOverloads constructor(
         )
 
         points.forEachIndexed { index, point ->
-            val paint = if (states[index]) redCirclePaint else greenCirclePaint
+            // Choose paint based on the circle's state
+            val paint = when(states[index]) {
+                CircleState.INCOMPLETE -> greenCirclePaint
+                CircleState.SUCCESS -> redCirclePaint
+                CircleState.FAILURE -> yellowCirclePaint
+            }
             canvas.drawCircle(point.x, point.y, dynamicRadius, paint)
         }
     }
