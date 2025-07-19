@@ -7,8 +7,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.View
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -23,12 +23,14 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.random.Random
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
     private lateinit var progressBar: ProgressBar
+    private lateinit var instructionsText: TextView
 
     private var camera: Camera? = null
     private var imageAnalyzer: ImageAnalysis? = null
@@ -41,7 +43,8 @@ class MainActivity : AppCompatActivity() {
     private var lastDetectedIdBox: RectF? = null
     private val circleStates = MutableList(6) { CircleState.INCOMPLETE }
     private val isCheckingHologram = BooleanArray(6) { false }
-    private var lastIdCardCrop: Bitmap? = null // *** KEY CHANGE: Store the ID card crop ***
+    private var lastIdCardCrop: Bitmap? = null
+    private var activeCircleIndex: Int? = null // *** KEY CHANGE: Track the active circle ***
     // --- End State Management ---
 
     companion object {
@@ -58,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.preview_view)
         overlayView = findViewById(R.id.overlay_view)
         progressBar = findViewById(R.id.progress_bar)
+        instructionsText = findViewById(R.id.instructions_text)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         if (allPermissionsGranted()) { startCamera() }
@@ -95,12 +99,20 @@ class MainActivity : AppCompatActivity() {
 
             currentFrameBitmap = getRotatedBitmap(imageProxy)
             val idCardCrop = cropBitmapByGuideBox(currentFrameBitmap)
-            lastIdCardCrop = idCardCrop // *** KEY CHANGE: Store the crop ***
+            lastIdCardCrop = idCardCrop
             imageProxy.close()
 
             if (idCardCrop != null) {
                 processAndSendIdCard(idCardCrop)
             } else {
+                runOnUiThread {
+                    instructionsText.text = "Position ID card in the box"
+                    overlayView.clearResults()
+                    // Reset states if card is lost
+                    if (activeCircleIndex != null || circleStates.any { it != CircleState.INCOMPLETE }) {
+                        resetHologramState()
+                    }
+                }
                 isProcessingFrame = false
             }
         }
@@ -142,7 +154,7 @@ class MainActivity : AppCompatActivity() {
                 guideBox.top + (bboxArray.getDouble(3).toFloat() / 640f) * guideBox.height()
             )
 
-            triggerHologramChecks(bitmapToAnalyze, lastDetectedIdBox!!)
+            manageHologramState(bitmapToAnalyze, lastDetectedIdBox!!)
 
         } catch (e: JSONException) {
             Log.e(TAG, "Failed to parse ID card JSON", e)
@@ -150,42 +162,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun triggerHologramChecks(bitmap: Bitmap, boxOnScreen: RectF) {
-        if (boxOnScreen.height() <= 0) {
-            isProcessingFrame = false
-            return
+    // *** KEY CHANGE: New central logic for managing the sequence ***
+    private fun manageHologramState(bitmap: Bitmap, boxOnScreen: RectF) {
+        // Step 1: If no circle is active, pick a new random one.
+        if (activeCircleIndex == null) {
+            val incompleteIndices = circleStates.mapIndexed { index, state -> if (state == CircleState.INCOMPLETE) index else null }.filterNotNull()
+            if (incompleteIndices.isNotEmpty()) {
+                activeCircleIndex = incompleteIndices.random(Random(System.currentTimeMillis()))
+                circleStates[activeCircleIndex!!] = CircleState.ACTIVE
+                runOnUiThread { instructionsText.text = "Create a reflection on the active circle" }
+            } else {
+                // This case should be handled by checkForCompletion, but as a fallback:
+                isProcessingFrame = false
+                return
+            }
         }
 
-        val dynamicRadius = (boxOnScreen.height() / 3f) / 2f
-        val insetMargin = dynamicRadius
+        updateOverlay() // Update overlay to show the new active circle
 
-        val pointsOnScreen = listOf(
-            PointF(boxOnScreen.left + insetMargin, boxOnScreen.top + insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.top + insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.top + insetMargin),
-            PointF(boxOnScreen.left + insetMargin, boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.bottom - insetMargin)
-        )
+        // Step 2: Check for reflection only on the active circle.
+        val activeIndex = activeCircleIndex
+        if (activeIndex != null && !isCheckingHologram[activeIndex] && boxOnScreen.height() > 0) {
+            val dynamicRadius = (boxOnScreen.height() / 3f) / 2f
+            val insetMargin = dynamicRadius
+            val pointsOnScreen = listOf(
+                PointF(boxOnScreen.left + insetMargin, boxOnScreen.top + insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.top + insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.top + insetMargin),
+                PointF(boxOnScreen.left + insetMargin, boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.centerX(), boxOnScreen.bottom - insetMargin), PointF(boxOnScreen.right - insetMargin, boxOnScreen.bottom - insetMargin)
+            )
 
-        var checksTriggered = false
-        pointsOnScreen.forEachIndexed { index, point ->
-            if (circleStates[index] == CircleState.SUCCESS || isCheckingHologram[index]) return@forEachIndexed
-
+            val point = pointsOnScreen[activeIndex]
             val regionOnScreen = RectF(point.x - dynamicRadius, point.y - dynamicRadius, point.x + dynamicRadius, point.y + dynamicRadius)
             val regionOnBitmap = mapPreviewBoxToBitmapBox(regionOnScreen, bitmap.width, bitmap.height)
 
             if (hasReflection(bitmap, regionOnBitmap)) {
-                checksTriggered = true
-                isCheckingHologram[index] = true
-                performHologramCheck(index) // No longer need to pass bitmap/region
+                isCheckingHologram[activeIndex] = true
+                performHologramCheck(activeIndex) // Check the specific active circle
+            } else {
+                isProcessingFrame = false // No reflection, wait for next frame
             }
+        } else {
+            isProcessingFrame = false // Already checking or no active circle, wait
         }
-
-        if (!checksTriggered) {
-            isProcessingFrame = false
-        }
-
-        updateOverlay()
     }
 
-    // *** KEY CHANGE: This function now uses the stored ID card crop ***
+
     private fun performHologramCheck(index: Int) {
         val idCardImage = lastIdCardCrop
         if (idCardImage == null) {
@@ -195,7 +215,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // We send the entire ID card image, not a new crop
         val finalBitmap = Bitmap.createScaledBitmap(idCardImage, 640, 640, true)
         val outputStream = ByteArrayOutputStream()
         finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
@@ -210,18 +229,21 @@ class MainActivity : AppCompatActivity() {
 
             if (checkPassed) {
                 circleStates[index] = CircleState.SUCCESS
+                activeCircleIndex = null // *** KEY CHANGE: Success, so un-set active circle to pick a new one
                 checkForCompletion()
             } else {
                 circleStates[index] = CircleState.FAILURE
                 Handler(Looper.getMainLooper()).postDelayed({
                     if(circleStates[index] == CircleState.FAILURE) {
-                        circleStates[index] = CircleState.INCOMPLETE
+                        // *** KEY CHANGE: Revert to ACTIVE, not INCOMPLETE
+                        circleStates[index] = CircleState.ACTIVE
                         updateOverlay()
                     }
                 }, 1000)
             }
 
             isCheckingHologram[index] = false
+            // Only set isProcessingFrame to false if no other checks are running (for safety)
             if (isCheckingHologram.none { it }) {
                 isProcessingFrame = false
             }
@@ -229,10 +251,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun resetHologramState() {
+        activeCircleIndex = null
+        for (i in circleStates.indices) {
+            circleStates[i] = CircleState.INCOMPLETE
+            isCheckingHologram[i] = false
+        }
+        updateOverlay()
+    }
+
+
     private fun checkForCompletion() {
         if (circleStates.all { it == CircleState.SUCCESS }) {
             runOnUiThread {
                 stopAnalysis()
+                instructionsText.text = "Verification Complete!"
                 AlertDialog.Builder(this)
                     .setTitle("Verification Complete")
                     .setMessage("All checks passed successfully.")
@@ -246,7 +279,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopAnalysis() {
         imageAnalyzer?.clearAnalyzer()
         camera?.cameraControl?.enableTorch(false)
-        isProcessingFrame = true
+        isProcessingFrame = true // Prevent any further processing
     }
 
     private fun updateOverlay() {
@@ -255,6 +288,10 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { overlayView.setResults(result) }
         }
     }
+
+    // --- Unchanged Helper Functions ---
+    // The following functions (hasReflection, getRotatedBitmap, cropBitmapByGuideBox, etc.)
+    // remain the same as in your original file.
 
     private fun hasReflection(bitmap: Bitmap, region: Rect): Boolean {
         if (region.width() <= 0 || region.height() <= 0) return false
@@ -324,6 +361,7 @@ class MainActivity : AppCompatActivity() {
         return Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
     }
 
+    @OptIn(ExperimentalGetImage::class)
     private fun ImageProxy.toBitmap(): Bitmap? {
         val image = this.image ?: return null
         if (image.format != ImageFormat.YUV_420_888) { return null }

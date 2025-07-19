@@ -30,7 +30,7 @@
         android:id="@+id/instructions_text"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="Position ID card in the box. Detection is active."
+        android:text="Position ID card in the box"
         android:textColor="@android:color/white"
         android:background="#80000000"
         android:padding="16dp"
@@ -39,8 +39,6 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"/>
-
-    <!-- The Button is removed -->
 
     <ProgressBar
         android:id="@+id/progress_bar"

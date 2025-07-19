@@ -6,11 +6,12 @@ import android.util.AttributeSet
 import android.view.View
 import kotlin.math.min
 
-// Enum to represent the three possible states of a validation circle
+// Enum to represent the possible states of a validation circle
 enum class CircleState {
-    INCOMPLETE, // Not yet validated (Green)
-    SUCCESS,    // Validation passed (Red)
-    FAILURE     // Validation failed (Yellow, temporary)
+    INCOMPLETE, // Not yet validated (White)
+    SUCCESS,    // Validation passed (Green)
+    FAILURE,    // Validation failed (Red, temporary)
+    ACTIVE      // The circle the user should currently focus on (Blue)
 }
 
 class OverlayView @JvmOverloads constructor(
@@ -37,27 +38,36 @@ class OverlayView @JvmOverloads constructor(
         isAntiAlias = true
     }
 
-    private val greenCirclePaint = Paint().apply {
+    private val incompleteCirclePaint = Paint().apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+        isAntiAlias = true
+    }
+
+    private val successCirclePaint = Paint().apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
         strokeWidth = 8f
         isAntiAlias = true
     }
 
-    private val redCirclePaint = Paint().apply {
+    private val failureCirclePaint = Paint().apply {
         color = Color.RED
         style = Paint.Style.STROKE
         strokeWidth = 8f
         isAntiAlias = true
     }
 
-    // New Paint for the failure state
-    private val yellowCirclePaint = Paint().apply {
-        color = Color.YELLOW
-        style = Paint.Style.STROKE
-        strokeWidth = 8f
+    // *** KEY CHANGE: New Paint for the active state ***
+    private val activeCirclePaint = Paint().apply {
+        color = Color.BLUE
+        style = Paint.Style.FILL_AND_STROKE // Make it stand out
+        strokeWidth = 10f
         isAntiAlias = true
+        setShadowLayer(15f, 0f, 0f, Color.BLUE) // Add a glow effect
     }
+
 
     data class DetectionResult(
         val box: RectF,
@@ -75,7 +85,7 @@ class OverlayView @JvmOverloads constructor(
 
         result?.let {
             canvas.drawRect(it.box, resultBoxPaint)
-            canvas.drawText(it.label, it.box.left, it.box.top - 10, resultTextPaint)
+            // canvas.drawText(it.label, it.box.left, it.box.top - 10, resultTextPaint) // Text is now in MainActivity
             drawValidationCircles(canvas, it.box, it.circleStates)
         }
     }
@@ -96,11 +106,12 @@ class OverlayView @JvmOverloads constructor(
         )
 
         points.forEachIndexed { index, point ->
-            // Choose paint based on the circle's state
+            // *** KEY CHANGE: Choose paint based on the circle's state, including ACTIVE ***
             val paint = when(states[index]) {
-                CircleState.INCOMPLETE -> greenCirclePaint
-                CircleState.SUCCESS -> redCirclePaint
-                CircleState.FAILURE -> yellowCirclePaint
+                CircleState.INCOMPLETE -> incompleteCirclePaint
+                CircleState.SUCCESS -> successCirclePaint
+                CircleState.FAILURE -> failureCirclePaint
+                CircleState.ACTIVE -> activeCirclePaint
             }
             canvas.drawCircle(point.x, point.y, dynamicRadius, paint)
         }
