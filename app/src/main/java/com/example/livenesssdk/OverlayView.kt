@@ -1,10 +1,7 @@
 package com.example.livenesssdk
 
 import android.content.Context
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
+import android.graphics.* // This will now correctly import PointF
 import android.util.AttributeSet
 import android.view.View
 import kotlin.math.min
@@ -33,23 +30,28 @@ class OverlayView @JvmOverloads constructor(
         isAntiAlias = true
     }
 
-    // --- Start of Changes ---
-
-    // Updated Paint for the larger, outlined green circles
-    private val circlePaint = Paint().apply {
+    private val greenCirclePaint = Paint().apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
-        strokeWidth = 8f // Make the outline thicker for better visibility
+        strokeWidth = 8f
         isAntiAlias = true
     }
 
+    private val redCirclePaint = Paint().apply {
+        color = Color.RED
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+        isAntiAlias = true
+    }
+
+    data class DetectionResult(
+        val box: RectF,
+        val label: String,
+        val circleStates: List<Boolean>
+    )
+
     private var result: DetectionResult? = null
     private var guideBox: RectF? = null
-    // The fixed circleRadius property is removed, as it's now dynamic.
-
-    // --- End of Changes ---
-
-    data class DetectionResult(val box: RectF, val label: String)
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
@@ -59,41 +61,30 @@ class OverlayView @JvmOverloads constructor(
         result?.let {
             canvas.drawRect(it.box, resultBoxPaint)
             canvas.drawText(it.label, it.box.left, it.box.top - 10, resultTextPaint)
-            drawValidationCircles(canvas, it.box)
+            drawValidationCircles(canvas, it.box, it.circleStates)
         }
     }
 
-    // --- Start of Changes ---
+    private fun drawValidationCircles(canvas: Canvas, box: RectF, states: List<Boolean>) {
+        if (box.height() <= 0 || states.size < 6) return
 
-    private fun drawValidationCircles(canvas: Canvas, box: RectF) {
-        // If the box has no height, we can't draw, so we exit early.
-        if (box.height() <= 0) return
-
-        // 1. Calculate the dynamic radius.
-        // "Circle size (diameter) is 1/3 of the bounding box height".
-        // So, the radius is half of that.
         val dynamicRadius = (box.height() / 3f) / 2f
-
-        // 2. Define a bigger, dynamic margin. We'll use the radius itself as the margin
-        // from the center of the circle to the edge of the box. This creates a nice, clean inset.
         val insetMargin = dynamicRadius
 
-        // 3. Draw the circles with the new dynamic values.
-        // Top-left corner
-        canvas.drawCircle(box.left + insetMargin, box.top + insetMargin, dynamicRadius, circlePaint)
-        // Top-right corner
-        canvas.drawCircle(box.right - insetMargin, box.top + insetMargin, dynamicRadius, circlePaint)
-        // Bottom-left corner
-        canvas.drawCircle(box.left + insetMargin, box.bottom - insetMargin, dynamicRadius, circlePaint)
-        // Bottom-right corner
-        canvas.drawCircle(box.right - insetMargin, box.bottom - insetMargin, dynamicRadius, circlePaint)
-        // Top-center
-        canvas.drawCircle(box.centerX(), box.top + insetMargin, dynamicRadius, circlePaint)
-        // Bottom-center
-        canvas.drawCircle(box.centerX(), box.bottom - insetMargin, dynamicRadius, circlePaint)
-    }
+        val points = listOf(
+            PointF(box.left + insetMargin, box.top + insetMargin),
+            PointF(box.centerX(), box.top + insetMargin),
+            PointF(box.right - insetMargin, box.top + insetMargin),
+            PointF(box.left + insetMargin, box.bottom - insetMargin),
+            PointF(box.centerX(), box.bottom - insetMargin),
+            PointF(box.right - insetMargin, box.bottom - insetMargin)
+        )
 
-    // --- End of Changes ---
+        points.forEachIndexed { index, point ->
+            val paint = if (states[index]) redCirclePaint else greenCirclePaint
+            canvas.drawCircle(point.x, point.y, dynamicRadius, paint)
+        }
+    }
 
     fun setResults(detection: DetectionResult?) {
         this.result = detection
