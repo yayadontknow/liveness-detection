@@ -2,22 +2,36 @@ package com.example.livenesssdk
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.graphics.PointF
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.YuvImage
+import android.media.MediaPlayer
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.widget.ProgressBar
+import android.view.View
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.*
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.face.Face
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -27,25 +41,39 @@ import kotlin.random.Random
 
 class MainActivity : AppCompatActivity() {
 
+    // --- Views ---
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
-    private lateinit var progressBar: ProgressBar
     private lateinit var instructionsText: TextView
+    private lateinit var rootLayout: View
 
+    // --- Camera & Analysis ---
     private var camera: Camera? = null
     private var imageAnalyzer: ImageAnalysis? = null
     private lateinit var cameraExecutor: ExecutorService
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+    // --- Sound ---
+    private var mediaPlayer: MediaPlayer? = null
 
     // --- State Management ---
+    private enum class AppState { ID_VERIFICATION, LIVENESS_CHALLENGE, FINISHED }
+    private var currentState = AppState.ID_VERIFICATION
+
     @Volatile
     private var isProcessingFrame = false
-    private var currentFrameBitmap: Bitmap? = null
+
+    // --- ID Verification State ---
     private var lastDetectedIdBox: RectF? = null
     private val circleStates = MutableList(6) { CircleState.INCOMPLETE }
     private val isCheckingHologram = BooleanArray(6) { false }
     private var lastIdCardCrop: Bitmap? = null
-    private var activeCircleIndex: Int? = null // *** KEY CHANGE: Track the active circle ***
-    // --- End State Management ---
+    private var activeCircleIndex: Int? = null
+
+    // --- Liveness Challenge State ---
+    private lateinit var colorFlasher: ColorFlasher
+    private lateinit var livenessDetector: LivenessDetector
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
@@ -58,14 +86,33 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // --- Initialize Views ---
         previewView = findViewById(R.id.preview_view)
         overlayView = findViewById(R.id.overlay_view)
-        progressBar = findViewById(R.id.progress_bar)
         instructionsText = findViewById(R.id.instructions_text)
+        rootLayout = findViewById(R.id.root)
+
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        if (allPermissionsGranted()) { startCamera() }
-        else { ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE) }
+        // --- Initialize Sound Player ---
+        mediaPlayer = MediaPlayer.create(this, R.raw.liveness_start_sound)
+
+        // --- Initialize Liveness Components ---
+        colorFlasher = ColorFlasher(rootLayout)
+        livenessDetector = LivenessDetector { isLive ->
+            runOnUiThread {
+                colorFlasher.stop()
+                currentState = AppState.FINISHED
+                showFinalResult(isLive, if (isLive) "Liveness Verified" else "Liveness Check Failed")
+            }
+        }
+
+        // --- Start Camera ---
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE)
+        }
     }
 
     private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -73,34 +120,57 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-            imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_16_9)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build().also { it.setAnalyzer(cameraExecutor, setupAnalyzer()) }
-
-            try {
-                cameraProvider.unbindAll()
-                camera = cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
-                camera?.cameraControl?.enableTorch(true)
-            } catch (exc: Exception) { Log.e(TAG, "Use case binding failed", exc) }
+            cameraProvider = cameraProviderFuture.get()
+            bindCameraUseCases()
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun setupAnalyzer(): ImageAnalysis.Analyzer {
+    private fun bindCameraUseCases() {
+        val provider = cameraProvider ?: return
+        val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+        imageAnalyzer = ImageAnalysis.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build().also {
+                when (currentState) {
+                    AppState.ID_VERIFICATION -> it.setAnalyzer(cameraExecutor, setupIdCardAnalyzer())
+                    AppState.LIVENESS_CHALLENGE -> it.setAnalyzer(cameraExecutor, setupLivenessAnalyzer())
+                    else -> {}
+                }
+            }
+
+        try {
+            provider.unbindAll()
+            camera = provider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+            camera?.cameraControl?.enableTorch(currentState == AppState.ID_VERIFICATION)
+        } catch (exc: Exception) {
+            Log.e(TAG, "Use case binding failed", exc)
+        }
+    }
+
+    // =================================================================================
+    // --- State 1: ID CARD VERIFICATION ---
+    // =================================================================================
+
+    private fun setupIdCardAnalyzer(): ImageAnalysis.Analyzer {
         return ImageAnalysis.Analyzer { imageProxy ->
-            if (isProcessingFrame) {
+            if (isProcessingFrame || currentState != AppState.ID_VERIFICATION) {
                 imageProxy.close()
                 return@Analyzer
             }
             isProcessingFrame = true
 
-            currentFrameBitmap = getRotatedBitmap(imageProxy)
+            val currentFrameBitmap = imageProxy.toBitmap()?.rotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            imageProxy.close()
+
+            if (currentFrameBitmap == null) {
+                isProcessingFrame = false
+                return@Analyzer
+            }
+
             val idCardCrop = cropBitmapByGuideBox(currentFrameBitmap)
             lastIdCardCrop = idCardCrop
-            imageProxy.close()
 
             if (idCardCrop != null) {
                 processAndSendIdCard(idCardCrop)
@@ -108,7 +178,6 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     instructionsText.text = "Position ID card in the box"
                     overlayView.clearResults()
-                    // Reset states if card is lost
                     if (activeCircleIndex != null || circleStates.any { it != CircleState.INCOMPLETE }) {
                         resetHologramState()
                     }
@@ -120,16 +189,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun processAndSendIdCard(idCardCrop: Bitmap) {
         val finalBitmap = Bitmap.createScaledBitmap(idCardCrop, 640, 640, true)
-        val outputStream = ByteArrayOutputStream()
-        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+        val outputStream = ByteArrayOutputStream().apply {
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, this)
+        }
 
-        NetworkClient.detectIdCard(imageBytes = outputStream.toByteArray()) { response, _ ->
-            handleIdCardResponse(response)
+        NetworkClient.detectIdCard(outputStream.toByteArray()) { response, _ ->
+            handleIdCardResponse(response, lastIdCardCrop)
         }
     }
 
-    private fun handleIdCardResponse(jsonResponse: String?) {
-        val bitmapToAnalyze = currentFrameBitmap
+    private fun handleIdCardResponse(jsonResponse: String?, bitmapToAnalyze: Bitmap?) {
         if (jsonResponse == null || bitmapToAnalyze == null) {
             runOnUiThread { overlayView.clearResults() }
             isProcessingFrame = false
@@ -155,32 +224,27 @@ class MainActivity : AppCompatActivity() {
             )
 
             manageHologramState(bitmapToAnalyze, lastDetectedIdBox!!)
-
         } catch (e: JSONException) {
             Log.e(TAG, "Failed to parse ID card JSON", e)
             isProcessingFrame = false
         }
     }
 
-    // *** KEY CHANGE: New central logic for managing the sequence ***
     private fun manageHologramState(bitmap: Bitmap, boxOnScreen: RectF) {
-        // Step 1: If no circle is active, pick a new random one.
         if (activeCircleIndex == null) {
-            val incompleteIndices = circleStates.mapIndexed { index, state -> if (state == CircleState.INCOMPLETE) index else null }.filterNotNull()
+            val incompleteIndices = circleStates.mapIndexedNotNull { index, state -> if (state == CircleState.INCOMPLETE) index else null }
             if (incompleteIndices.isNotEmpty()) {
                 activeCircleIndex = incompleteIndices.random(Random(System.currentTimeMillis()))
                 circleStates[activeCircleIndex!!] = CircleState.ACTIVE
                 runOnUiThread { instructionsText.text = "Create a reflection on the active circle" }
             } else {
-                // This case should be handled by checkForCompletion, but as a fallback:
                 isProcessingFrame = false
                 return
             }
         }
 
-        updateOverlay() // Update overlay to show the new active circle
+        updateOverlay()
 
-        // Step 2: Check for reflection only on the active circle.
         val activeIndex = activeCircleIndex
         if (activeIndex != null && !isCheckingHologram[activeIndex] && boxOnScreen.height() > 0) {
             val dynamicRadius = (boxOnScreen.height() / 3f) / 2f
@@ -196,28 +260,27 @@ class MainActivity : AppCompatActivity() {
 
             if (hasReflection(bitmap, regionOnBitmap)) {
                 isCheckingHologram[activeIndex] = true
-                performHologramCheck(activeIndex) // Check the specific active circle
+                performHologramCheck(activeIndex)
             } else {
-                isProcessingFrame = false // No reflection, wait for next frame
+                isProcessingFrame = false
             }
         } else {
-            isProcessingFrame = false // Already checking or no active circle, wait
+            isProcessingFrame = false
         }
     }
 
-
     private fun performHologramCheck(index: Int) {
-        val idCardImage = lastIdCardCrop
-        if (idCardImage == null) {
-            Log.e(TAG, "Cannot perform hologram check, ID card image is null")
+        val idCardImage = lastIdCardCrop ?: run {
+            Log.e(TAG, "ID card image is null")
             isCheckingHologram[index] = false
             isProcessingFrame = false
             return
         }
 
         val finalBitmap = Bitmap.createScaledBitmap(idCardImage, 640, 640, true)
-        val outputStream = ByteArrayOutputStream()
-        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
+        val outputStream = ByteArrayOutputStream().apply {
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, this)
+        }
 
         NetworkClient.detectHologram(outputStream.toByteArray()) { response, _ ->
             val numDetections = try {
@@ -229,21 +292,18 @@ class MainActivity : AppCompatActivity() {
 
             if (checkPassed) {
                 circleStates[index] = CircleState.SUCCESS
-                activeCircleIndex = null // *** KEY CHANGE: Success, so un-set active circle to pick a new one
+                activeCircleIndex = null
                 checkForCompletion()
             } else {
                 circleStates[index] = CircleState.FAILURE
                 Handler(Looper.getMainLooper()).postDelayed({
-                    if(circleStates[index] == CircleState.FAILURE) {
-                        // *** KEY CHANGE: Revert to ACTIVE, not INCOMPLETE
+                    if (circleStates[index] == CircleState.FAILURE) {
                         circleStates[index] = CircleState.ACTIVE
                         updateOverlay()
                     }
                 }, 1000)
             }
-
             isCheckingHologram[index] = false
-            // Only set isProcessingFrame to false if no other checks are running (for safety)
             if (isCheckingHologram.none { it }) {
                 isProcessingFrame = false
             }
@@ -251,35 +311,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun resetHologramState() {
-        activeCircleIndex = null
-        for (i in circleStates.indices) {
-            circleStates[i] = CircleState.INCOMPLETE
-            isCheckingHologram[i] = false
-        }
-        updateOverlay()
-    }
-
-
     private fun checkForCompletion() {
         if (circleStates.all { it == CircleState.SUCCESS }) {
             runOnUiThread {
-                stopAnalysis()
-                instructionsText.text = "Verification Complete!"
-                AlertDialog.Builder(this)
-                    .setTitle("Verification Complete")
-                    .setMessage("All checks passed successfully.")
-                    .setPositiveButton("OK") { dialog, _ -> dialog.dismiss(); finish() }
-                    .setCancelable(false)
-                    .show()
+                transitionToLivenessState()
             }
         }
     }
 
-    private fun stopAnalysis() {
-        imageAnalyzer?.clearAnalyzer()
-        camera?.cameraControl?.enableTorch(false)
-        isProcessingFrame = true // Prevent any further processing
+    private fun resetHologramState() {
+        activeCircleIndex = null
+        circleStates.fill(CircleState.INCOMPLETE)
+        isCheckingHologram.fill(false)
+        updateOverlay()
     }
 
     private fun updateOverlay() {
@@ -289,16 +333,70 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // --- Unchanged Helper Functions ---
-    // The following functions (hasReflection, getRotatedBitmap, cropBitmapByGuideBox, etc.)
-    // remain the same as in your original file.
+    // =================================================================================
+    // --- State 2: LIVENESS CHALLENGE ---
+    // =================================================================================
+
+    private fun transitionToLivenessState() {
+        currentState = AppState.LIVENESS_CHALLENGE
+        isProcessingFrame = true // Prevent ID analysis
+
+        // 1. Update UI and play sound
+        instructionsText.text = "Get ready for liveness check..."
+        mediaPlayer?.start() // Play sound cue
+        overlayView.clearResults()
+        camera?.cameraControl?.enableTorch(false)
+
+        // 2. Switch camera after a delay
+        Handler(Looper.getMainLooper()).postDelayed({
+            cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+            livenessDetector.reset()
+            bindCameraUseCases()
+            colorFlasher.start()
+            instructionsText.text = "Look at the camera"
+            isProcessingFrame = false
+        }, 1500)
+    }
+
+    private fun setupLivenessAnalyzer(): ImageAnalysis.Analyzer {
+        val cameraAnalyzer = CameraAnalyzer(this) { bitmap, face ->
+            if (currentState == AppState.LIVENESS_CHALLENGE) {
+                livenessDetector.processFrame(bitmap, face, colorFlasher.currentColor)
+            }
+        }
+        return ImageAnalysis.Analyzer { imageProxy ->
+            if (currentState != AppState.LIVENESS_CHALLENGE) {
+                imageProxy.close()
+                return@Analyzer
+            }
+            // Liveness analyzer manages its own isProcessingFrame and closes its own proxy
+            cameraAnalyzer.analyze(imageProxy)
+        }
+    }
+
+    // =================================================================================
+    // --- HELPER FUNCTIONS ---
+    // =================================================================================
+
+    private fun showFinalResult(isSuccess: Boolean, message: String) {
+        val title = if (isSuccess) "Verification Complete" else "Verification Failed"
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("OK") { dialog, _ ->
+                dialog.dismiss()
+                finish()
+            }
+            .setCancelable(false)
+            .show()
+    }
 
     private fun hasReflection(bitmap: Bitmap, region: Rect): Boolean {
         if (region.width() <= 0 || region.height() <= 0) return false
         region.intersect(0, 0, bitmap.width, bitmap.height)
         val totalPixels = region.width() * region.height()
         if (totalPixels == 0) return false
-        var brightPixelCount = 0
+
         val pixels = IntArray(totalPixels)
         try {
             bitmap.getPixels(pixels, 0, region.width(), region.left, region.top, region.width(), region.height())
@@ -306,8 +404,10 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Error getting pixels from region $region", e)
             return false
         }
+
+        var brightPixelCount = 0
         for (color in pixels) {
-            val brightness = (Color.red(color) + Color.green(color) + Color.blue(color)) / 3
+            val brightness = (android.graphics.Color.red(color) + android.graphics.Color.green(color) + android.graphics.Color.blue(color)) / 3
             if (brightness > BRIGHTNESS_THRESHOLD) {
                 brightPixelCount++
             }
@@ -316,21 +416,13 @@ class MainActivity : AppCompatActivity() {
         return percentage > BRIGHT_PIXEL_PERCENTAGE_THRESHOLD
     }
 
-    private fun getRotatedBitmap(image: ImageProxy): Bitmap? {
-        val fullBitmap = image.toBitmap() ?: return null
-        val rotationDegrees = image.imageInfo.rotationDegrees
-        val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        return Bitmap.createBitmap(fullBitmap, 0, 0, fullBitmap.width, fullBitmap.height, matrix, true)
-    }
-
-    private fun cropBitmapByGuideBox(sourceBitmap: Bitmap?): Bitmap? {
-        if (sourceBitmap == null) return null
+    private fun cropBitmapByGuideBox(sourceBitmap: Bitmap): Bitmap? {
         val guideBox = overlayView.getGuideBox()
         val cropRect = mapPreviewBoxToBitmapBox(guideBox, sourceBitmap.width, sourceBitmap.height)
         return try {
             Bitmap.createBitmap(sourceBitmap, cropRect.left, cropRect.top, cropRect.width(), cropRect.height())
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to crop bitmap", e)
+            Log.e(TAG, "Failed to crop bitmap with rect: $cropRect", e)
             null
         }
     }
@@ -338,33 +430,36 @@ class MainActivity : AppCompatActivity() {
     private fun mapPreviewBoxToBitmapBox(previewBox: RectF, bitmapWidth: Int, bitmapHeight: Int): Rect {
         val previewRatio = previewView.width.toFloat() / previewView.height.toFloat()
         val bitmapRatio = bitmapWidth.toFloat() / bitmapHeight.toFloat()
-        val newLeft: Float
-        val newTop: Float
-        val newWidth: Float
-        val newHeight: Float
-        if (bitmapRatio > previewRatio) {
-            newWidth = bitmapWidth.toFloat()
-            newHeight = bitmapWidth / previewRatio
-            newLeft = 0f
-            newTop = (newHeight - bitmapHeight) / 2f
+
+        val scale: Float
+        var offsetX = 0f
+        var offsetY = 0f
+
+        if (previewRatio > bitmapRatio) {
+            scale = previewView.width.toFloat() / bitmapWidth.toFloat()
+            val newHeight = bitmapHeight.toFloat() * scale
+            offsetY = (previewView.height.toFloat() - newHeight) / 2f
         } else {
-            newHeight = bitmapHeight.toFloat()
-            newWidth = bitmapHeight * previewRatio
-            newTop = 0f
-            newLeft = (newWidth - bitmapWidth) / 2f
+            scale = previewView.height.toFloat() / bitmapHeight.toFloat()
+            val newWidth = bitmapWidth.toFloat() * scale
+            offsetX = (previewView.width.toFloat() - newWidth) / 2f
         }
-        val scale = newWidth / previewView.width.toFloat()
-        val left = (previewBox.left * scale) - newLeft
-        val top = (previewBox.top * scale) - newTop
-        val right = (previewBox.right * scale) - newLeft
-        val bottom = (previewBox.bottom * scale) - newLeft
-        return Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
+
+        val left = ((previewBox.left - offsetX) / scale).toInt()
+        val top = ((previewBox.top - offsetY) / scale).toInt()
+        val right = ((previewBox.right - offsetX) / scale).toInt()
+        val bottom = ((previewBox.bottom - offsetY) / scale).toInt()
+
+        return Rect(left, top, right, bottom)
     }
 
     @OptIn(ExperimentalGetImage::class)
     private fun ImageProxy.toBitmap(): Bitmap? {
         val image = this.image ?: return null
-        if (image.format != ImageFormat.YUV_420_888) { return null }
+        if (image.format != ImageFormat.YUV_420_888) {
+            Log.e(TAG, "Unsupported image format: ${image.format}")
+            return null
+        }
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer
         val vBuffer = image.planes[2].buffer
@@ -382,10 +477,17 @@ class MainActivity : AppCompatActivity() {
         return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
+    private fun Bitmap.rotate(degrees: Float): Bitmap {
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == CAMERA_PERMISSION_CODE) {
-            if (allPermissionsGranted()) { startCamera() } else {
+            if (allPermissionsGranted()) {
+                startCamera()
+            } else {
                 Toast.makeText(this, "Camera permissions are required.", Toast.LENGTH_LONG).show()
                 finish()
             }
@@ -396,5 +498,11 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor.shutdown()
         camera?.cameraControl?.enableTorch(false)
+        if (::colorFlasher.isInitialized) {
+            colorFlasher.stop()
+        }
+        // Release media player resources
+        mediaPlayer?.release()
+        mediaPlayer = null
     }
 }
