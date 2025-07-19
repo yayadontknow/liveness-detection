@@ -8,7 +8,6 @@ import android.util.Log
 import android.view.View
 import android.widget.ProgressBar
 import android.widget.Toast
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.core.Camera
@@ -31,7 +30,6 @@ class MainActivity : AppCompatActivity() {
     private var camera: Camera? = null
     private lateinit var cameraExecutor: ExecutorService
 
-    // Flag to control processing rate
     @Volatile
     private var isProcessing = false
 
@@ -73,7 +71,6 @@ class MainActivity : AppCompatActivity() {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
-            // Set up ImageAnalysis for real-time processing
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -98,7 +95,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupAnalyzer(): ImageAnalysis.Analyzer {
         return ImageAnalysis.Analyzer { imageProxy ->
-            // If we are already processing a frame, skip this one
             if (isProcessing) {
                 imageProxy.close()
                 return@Analyzer
@@ -114,7 +110,6 @@ class MainActivity : AppCompatActivity() {
                 processAndSendImage(croppedBitmap)
             } else {
                 Log.e(TAG, "Failed to crop image.")
-                // Allow processing the next frame
                 isProcessing = false
             }
         }
@@ -187,7 +182,6 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Toast.makeText(this, "Network Error: $error", Toast.LENGTH_LONG).show()
                 }
-                // Important: Allow the next frame to be processed
                 isProcessing = false
             }
         }
@@ -196,42 +190,40 @@ class MainActivity : AppCompatActivity() {
     private fun handleNetworkResponse(jsonResponse: String) {
         try {
             val detections = JSONObject(jsonResponse).getJSONArray("detections")
-            val results = mutableListOf<OverlayView.DetectionResult>()
-            val guideBox = overlayView.getGuideBox()
 
             if (detections.length() == 0) {
-                overlayView.clearResults() // Clear previous boxes if nothing is detected
+                overlayView.setResults(null) // Clear previous boxes if nothing is detected
                 return
             }
 
-            for (i in 0 until detections.length()) {
-                val detection = detections.getJSONObject(i)
-                val confidence = detection.getDouble("confidence")
-                val bboxArray = detection.getJSONArray("bbox")
-                val x1 = bboxArray.getDouble(0).toFloat()
-                val y1 = bboxArray.getDouble(1).toFloat()
-                val x2 = bboxArray.getDouble(2).toFloat()
-                val y2 = bboxArray.getDouble(3).toFloat()
+            // Assume we only care about the first detection from the server
+            val firstDetection = detections.getJSONObject(0)
+            val confidence = firstDetection.getDouble("confidence")
+            val bboxArray = firstDetection.getJSONArray("bbox")
+            val x1 = bboxArray.getDouble(0).toFloat()
+            val y1 = bboxArray.getDouble(1).toFloat()
+            val x2 = bboxArray.getDouble(2).toFloat()
+            val y2 = bboxArray.getDouble(3).toFloat()
 
-                val resultBox = RectF(
-                    guideBox.left + (x1 / 640f) * guideBox.width(),
-                    guideBox.top + (y1 / 640f) * guideBox.height(),
-                    guideBox.left + (x2 / 640f) * guideBox.width(),
-                    guideBox.top + (y2 / 640f) * guideBox.height()
-                )
-                val label = "ID Confidence: ${String.format("%.2f", confidence)}"
-                results.add(OverlayView.DetectionResult(resultBox, label))
-            }
-            overlayView.setResults(results)
+            val guideBox = overlayView.getGuideBox()
+            val resultBox = RectF(
+                guideBox.left + (x1 / 640f) * guideBox.width(),
+                guideBox.top + (y1 / 640f) * guideBox.height(),
+                guideBox.left + (x2 / 640f) * guideBox.width(),
+                guideBox.top + (y2 / 640f) * guideBox.height()
+            )
+            val label = "ID Confidence: ${String.format("%.2f", confidence)}"
+
+            // Create a single result and pass it to the view
+            val result = OverlayView.DetectionResult(resultBox, label)
+            overlayView.setResults(result)
+
         } catch (e: JSONException) {
             Log.e(TAG, "Failed to parse JSON response", e)
             Toast.makeText(this, "Invalid response from server.", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Helper function to convert ImageProxy (YUV_420_888) to Bitmap
-    // This is more robust for ImageAnalysis frames.
-    @OptIn(ExperimentalGetImage::class)
     private fun ImageProxy.toBitmap(): Bitmap? {
         val image = this.image ?: return null
         if (image.format != ImageFormat.YUV_420_888) {
