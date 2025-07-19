@@ -30,7 +30,7 @@
         android:id="@+id/instructions_text"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="Place your ID card inside the white box and press DETECT"
+        android:text="Position ID card in the box. Detection is active."
         android:textColor="@android:color/white"
         android:background="#80000000"
         android:padding="16dp"
@@ -40,15 +40,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"/>
 
-    <Button
-        android:id="@+id/detect_button"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Detect"
-        android:layout_marginBottom="32dp"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+    <!-- The Button is removed -->
 
     <ProgressBar
         android:id="@+id/progress_bar"

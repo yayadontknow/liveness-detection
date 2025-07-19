@@ -6,9 +6,9 @@ import android.graphics.*
 import android.os.Bundle
 import android.util.Log
 import android.view.View
-import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.core.Camera
@@ -26,13 +26,14 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
-    private lateinit var detectButton: Button
     private lateinit var progressBar: ProgressBar
 
-    private var imageCapture: ImageCapture? = null
     private var camera: Camera? = null
-
     private lateinit var cameraExecutor: ExecutorService
+
+    // Flag to control processing rate
+    @Volatile
+    private var isProcessing = false
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
@@ -45,12 +46,9 @@ class MainActivity : AppCompatActivity() {
 
         previewView = findViewById(R.id.preview_view)
         overlayView = findViewById(R.id.overlay_view)
-        detectButton = findViewById(R.id.detect_button)
         progressBar = findViewById(R.id.progress_bar)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-
-        detectButton.setOnClickListener { takePhoto() }
 
         if (allPermissionsGranted()) {
             startCamera()
@@ -70,21 +68,27 @@ class MainActivity : AppCompatActivity() {
 
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
             val preview = Preview.Builder().build().also {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
-            imageCapture = ImageCapture.Builder()
+
+            // Set up ImageAnalysis for real-time processing
+            val imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, setupAnalyzer())
+                }
 
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
                 cameraProvider.unbindAll()
-                camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture)
+                camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
                 camera?.cameraControl?.enableTorch(true)
-                Log.d(TAG, "Camera started and flashlight enabled.")
+                Log.d(TAG, "Camera started with real-time analysis.")
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
                 Toast.makeText(this, "Failed to start camera.", Toast.LENGTH_SHORT).show()
@@ -92,36 +96,28 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun takePhoto() {
-        val imageCapture = imageCapture ?: return
-        setUiInProgress(true)
-        overlayView.clearResults()
-
-        imageCapture.takePicture(
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(image: ImageProxy) {
-                    Log.d(TAG, "Photo capture success. Image Resolution: ${image.width}x${image.height}, Rotation: ${image.imageInfo.rotationDegrees}")
-
-                    val croppedBitmap = getCroppedBitmap(image)
-                    image.close()
-
-                    if (croppedBitmap != null) {
-                        processAndSendImage(croppedBitmap)
-                    } else {
-                        Log.e(TAG, "Failed to crop image.")
-                        setUiInProgress(false)
-                        Toast.makeText(baseContext, "Failed to process image.", Toast.LENGTH_SHORT).show()
-                    }
-                }
-
-                override fun onError(exc: ImageCaptureException) {
-                    Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
-                    setUiInProgress(false)
-                    Toast.makeText(baseContext, "Photo capture failed: ${exc.message}", Toast.LENGTH_SHORT).show()
-                }
+    private fun setupAnalyzer(): ImageAnalysis.Analyzer {
+        return ImageAnalysis.Analyzer { imageProxy ->
+            // If we are already processing a frame, skip this one
+            if (isProcessing) {
+                imageProxy.close()
+                return@Analyzer
             }
-        )
+
+            isProcessing = true
+
+            val croppedBitmap = getCroppedBitmap(imageProxy)
+            imageProxy.close()
+
+            if (croppedBitmap != null) {
+                runOnUiThread { setUiInProgress(true) }
+                processAndSendImage(croppedBitmap)
+            } else {
+                Log.e(TAG, "Failed to crop image.")
+                // Allow processing the next frame
+                isProcessing = false
+            }
+        }
     }
 
     private fun getCroppedBitmap(image: ImageProxy): Bitmap? {
@@ -191,6 +187,8 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Toast.makeText(this, "Network Error: $error", Toast.LENGTH_LONG).show()
                 }
+                // Important: Allow the next frame to be processed
+                isProcessing = false
             }
         }
     }
@@ -198,12 +196,13 @@ class MainActivity : AppCompatActivity() {
     private fun handleNetworkResponse(jsonResponse: String) {
         try {
             val detections = JSONObject(jsonResponse).getJSONArray("detections")
-            if (detections.length() == 0) {
-                Toast.makeText(this, "No ID card detected.", Toast.LENGTH_SHORT).show()
-                return
-            }
             val results = mutableListOf<OverlayView.DetectionResult>()
             val guideBox = overlayView.getGuideBox()
+
+            if (detections.length() == 0) {
+                overlayView.clearResults() // Clear previous boxes if nothing is detected
+                return
+            }
 
             for (i in 0 until detections.length()) {
                 val detection = detections.getJSONObject(i)
@@ -230,9 +229,38 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Helper function to convert ImageProxy (YUV_420_888) to Bitmap
+    // This is more robust for ImageAnalysis frames.
+    @OptIn(ExperimentalGetImage::class)
+    private fun ImageProxy.toBitmap(): Bitmap? {
+        val image = this.image ?: return null
+        if (image.format != ImageFormat.YUV_420_888) {
+            Log.e("ImageProxyExt", "Unsupported image format: ${image.format}")
+            return null
+        }
+
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, this.width, this.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 95, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
     private fun setUiInProgress(inProgress: Boolean) {
         progressBar.visibility = if (inProgress) View.VISIBLE else View.GONE
-        detectButton.isEnabled = !inProgress
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -251,14 +279,5 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor.shutdown()
         camera?.cameraControl?.enableTorch(false)
-    }
-
-    // Helper function to convert ImageProxy to Bitmap
-    private fun ImageProxy.toBitmap(): Bitmap? {
-        val planeProxy = this.planes[0]
-        val buffer = planeProxy.buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 }
